@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+#
+# marsala - an addition to tiramisu
+
+refresh() {
+    # The pure bash method of grabbing the terminal
+    # size in cells in unreliable. This command always
+    # works and doesn't add a tiny delay.
+    shopt -s checkwinsize; (:;:)
+
+    # '\e[?1049h': Swap to the alternate buffer.
+    # '\e[?7l':    Disable line wrapping.
+    # '\e[?25l':   Hide the cursor.
+    # '\e[2J':     Clear the screen.
+    # '\e[3;%sr':  Set the scroll area.
+    # '\e[999H':   Move the cursor to the bottom.
+    printf '\e[?1049h\e[?7l\e[?25l\e[2J\e[3;%sr\e[999H' \
+           "$((LINES-1))"
+
+    # Hide echoing of user input
+    stty -echo
+}
+
+
+clean() {
+    # source the .client file to
+    # get and update the client list
+    # update the declaration of cL in .client
+    # by redirecting the out of declare -p cL
+    . .clients &>/dev/null
+    cL=( "${cL[@]//$$}" )
+    cL=( "${cL[@]//''}" )
+    declare -p cL > .clients
+
+    # '\e[?7h':    Re-enable line wrapping.
+    # '\e[?25h':   Unhide the cursor.
+    # '\e[2J':     Clear the screen.
+    # '\e[;r':     Reset the scroll area.
+    # '\e[?1049l': Swap back to the primary screen.
+    printf '\e[?7h\e[?25h\e[2J\e[r\e[?1049l'
+
+    # Show user input.
+    stty echo
+
+    # Kill the IRC client to also exit the child
+    # listener which runs in the background.
+    #kill 0
+}
+
+
+status() {
+    srcL=(*[^:]) #srcL=" ${srcL[*]} "
+    printf '\e7\e[H\e[K%b\e8' \
+        "${srcL[*]/"$src"/ ${BIRCH_STATUS:=$'\e[7m'}"$src"$'\e[m' }"
+}
+
+resize() {
+    # resize enables the traps for WINCH and SIGUSR1
+    # to stop being interrupted while in the middle of
+    # the resize function causing visual artifacts
+    # The traps are disabled as precaution
+    trap - WINCH && trap '' SIGUSR1
+
+    refresh
+    status
+
+    printf '\r\e[999B\e[A'
+
+    # Print the last N lines of the log file.
+    {
+        mapfile -tn 0 log 2>/dev/null < "$src"
+        printf '%s\n' \
+            "${log[@]: -(LINES > ${#log[@]} ? ${#log[@]} : LINES)}"
+    }
+
+    # refresh term on recieving
+    # SIGUSR1 from the daemon
+    # WINCH   from the client
+    trap resize WINCH && trap resize SIGUSR1
+}
+
+
+fold_line() {
+    local indent fold=$1 str="$2" pos=0 start
+    local char=''
+    while :; do
+        ((start=pos, pos+=fold))
+        ((pos>=${#str})) && break
+        for((;pos>=0;pos--)){ char=${str:$pos:1}
+            [[ " \"'!#$.,:;]})|\\/" == *$char* ]] && break
+            [[ $'\n' == "$char" ]] && break
+        }
+        ((start>=pos)) && ((pos+=fold))
+        printf -v str '%s\n%s' "${str::$pos}" "${str: $pos}"
+        ((pos+=1))
+        ((F==1)) && read -rn1 -p "$str"
+    done
+
+    # indent the output
+    printf -v indent '\n%*s' '11' ''
+    str=${str//$'\n'/$indent}
+
+    printf -- '%s' "$str"
+}
+
+
+prnt() {
+    local timestamp
+    ((Ln==0)) && { src="$1"; Ln=1; return; }
+    ((Ln==1)) && { printf -v timestamp '%(%T)T ' "-1"; }
+    [[ "$1" == "<notif-end>" ]] && {
+        # Send signal to clients
+        # to refresh their displays
+        . .clients &>/dev/null
+        cL=( ${cL[@]//''} )
+        kill -10 -- ${cL[*]} &>/dev/null
+        ((Ln=0))
+        return
+    }
+
+    # Word wrap each line at 60
+    content=$(fold_line 60 "$1")
+
+    # Offset cursor to accommodate
+    # the timestamp of the notification
+    # Customisation for timestamp will most likely
+    # not be added
+    printf -v out '%*s%s' \
+              "11" "$timestamp"  \
+              "$content"
+
+    # Log the notification to the respective temp file
+    # This is how history, resize and buffer swaps work.
+    printf '%s\n' "$out" >> "$src"
+    ((Ln+=1))
+}
+
+
+daemon() {
+    # If the daemon exits remove the PID file
+    trap 'rm .PID; kill 0' EXIT
+
+    # check if an instance is alread running
+    [[ -s .PID ]] && {
+        read -r pid < .PID
+        [[ -d "/proc/$pid" ]] && {
+            printf 'Daemon is already running\n' >&2
+            exit 1
+        }
+    }
+    printf "%s" "$$" > .PID
+
+    # The format used in tiramisu by marsala
+    # #source      --- Which file to store in
+    #    :         -.
+    #    :           } User defined format
+    #    :         -'
+    # <notif-end>  --- Marsala's way of
+    #                  finding the end of notif
+    printf -v t_f '#source\n%s\n<notif-end>'\
+                  "${TIRAMISU_FORMAT:-#summary$'\n'#body}"
+
+    # The output from tiramisu is read line by line
+    # The format is ended with a <notif_end>
+    while read -sr; do
+        prnt "$REPLY"
+    done < <(tiramisu -o "$t_f")
+}
+
+gen_help() {
+    printf  '%*s%s\n'\
+            '11' 'Name : ' 'marsala'\
+            '11' 'Version : ' '0.0.1'\
+            '11' 'Keys : ' 'Keys   Function'\
+            '11' '' 'n ->   next source feed'\
+            '11' '' 'p <-   prev source feed'\
+            '11' '' 'r      refresh feed'\
+            '11' '' 'c      clear the current feed'\
+            '11' '' 'P      display the current field in a pager'\
+            '11' '' '?      print this help' > "$src"
+}
+
+client() {
+    [[ -a .PID ]] || {
+        printf 'Daemon isn'\''t runing\n' >&2
+        exit 1
+    }
+
+    # trap Ctrl+C and reset-terminal
+    trap 'clean ; kill 0'  EXIT
+
+    # source the .client file to
+    # get and update the client list
+    # update the declaration of cL in .client
+    # by redirecting the out of declare -p cL
+    . ".clients" &>/dev/null
+    cL=( ${cL[@]//''} "$$" )
+    declare -p cL > .clients
+
+    src='*'
+    gen_help
+
+    resize
+
+    while status && read -rsn 1 R; do case $R in
+        \?) src='*'; z=0 ;;
+        n|C) src=${srcL[z=z+1 >= ${#srcL[@]} ? ${#srcL[@]}-1 : z+1]} ;;
+        p|D) src=${srcL[z=z-1 <  0 ? 0 : z-1]} ;;
+        r) ;;
+        c) :> "$src" ;;
+        P) clean; ${PAGER:-less} "$src" ;;
+        q) exit ;;
+    esac; [[ $R =~ \?|P|n|p|C|D|c|r ]] && resize; done
+}
+
+args() {
+    # Simple argument parsing. We use 'declare' to... declare
+    # variables named after the argument they represent (-b == $b).
+    while getopts :F:Dv opt; do case $opt in
+        \?)
+            printf 'marsala [-hv] [-D]\n\n'
+            printf -- '-D (start daemon)\n'
+            printf -- '-h (help)\n'
+            printf -- '-v (version)\n'
+        ;;
+
+        F) F=1; fold_line 60 "$OPTARG" ;;
+        D) declare -g D=1 ;;
+        v) printf 'marsala 0.0.1\n' ;;
+        :) printf 'Option -%s requires an argument\n' "$OPTARG" >&2 ;;
+        *) declare -g "$opt=$OPTARG" ;;
+    esac; [[ $opt =~ \?|v|F|: ]] && exit; done
+}
+
+main() {
+    args "$@"
+
+    # Enable loadable bash builtins if available.
+    # YES! Bash has loadable builtins for a myriad of
+    # external commands. This includes 'sleep'!
+    enable -f /usr/lib/bash/mkdir mkdir 2>/dev/null
+    enable -f /usr/lib/bash/sleep sleep 2>/dev/null
+
+    # Create the temporary directory
+    # Change PWD for ease
+    mkdir -p "${MARSALA_TMPDIR:=/tmp}/marsala"
+    cd "$_" || exit 1
+
+    # Start the daemon if the the daemon flag is set to 1.
+    # Else start the client
+    ((   D )) && daemon
+    (( ! D )) && client
+}
+
+main "$@"
