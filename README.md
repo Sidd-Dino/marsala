@@ -2,7 +2,7 @@
 
 A notification aggregator based on tiramisu written in bash
 
-![scrot](https://user-images.githubusercontent.com/48709691/129191588-62e9461c-4658-414c-8b60-c04c74d8f558.png)
+![scrot](https://imgur.com/ndbJ2HJ.png)
 
 
 ## Features
